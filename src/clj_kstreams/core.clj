@@ -3,8 +3,8 @@
             [org.apache.kafka.streams.kstream KStreamBuilder ValueMapper KeyValueMapper Predicate]
             [org.apache.kafka.connect.json JsonSerializer JsonDeserializer]
             [org.apache.kafka.common.serialization Deserializer Serdes]
-            ;[com.fasterxml.jackson.annotation JsonInclude]
             [com.fasterxml.jackson.databind ObjectMapper])
+  (:require clj-kstreams.geocoder)
   (:gen-class))
 
 (def config
@@ -43,22 +43,23 @@
 (defmethod extract-air-temp :data
   [v]
   (let [air-temp (-> v (.get "data") (.get "data") (.get "air_temp"))]
-    { :unit  (.asText (.get air-temp "unit"))
-      :value (.doubleValue (.get air-temp "value"))}))
+    { "unit"  (.asText (.get air-temp "unit"))
+      "value" (.doubleValue (.get air-temp "value"))}))
 (defmethod extract-air-temp :variables
   [v]
   (let [air-temp (-> v (.get "data") (.get "variables") (.get "air_temp"))]
-    { :unit  (.asText (.get air-temp "units"))
-      :value (.doubleValue (.get air-temp "value"))}))
+    { "unit"  (.asText (.get air-temp "units"))
+      "value" (.doubleValue (.get air-temp "value"))}))
 
 (defn extract-coords
   [v]
   (let [coords (-> v (.get "data") (.get "coords"))]
-  { :lat  (.doubleValue (.get coords "lat"))
-    :lon  (.doubleValue (.get coords "lon"))}))
+  { "lat"  (.doubleValue (.get coords "lat"))
+    "lon"  (.doubleValue (.get coords "lon"))}))
 
-(def run-input
-  (-> input-stream
+(defn run-input
+  [stream]
+  (-> stream
     (.map (reify KeyValueMapper
       (apply [_ k v]
         (KeyValue. (.getBytes (.asText (.get v "type"))) v))))
@@ -66,27 +67,40 @@
     (.mapValues (reify ValueMapper
       (apply [_ v]
         (let [air-temp (try (extract-air-temp v) (catch Exception e nil))]
-          (if (nil? air-temp) nil (merge air-temp {:coords (extract-coords v)}))))))
+          (if (nil? air-temp) nil (merge air-temp {"coords" (extract-coords v)}))))))
     (.filterNot (pred [_ v] (nil? v)))
     (.mapValues (reify ValueMapper
       (apply [_ v]
         (.valueToTree mapper v))))
     (.to (Serdes/ByteArray) json-serde "atmospheric-data")))
 
-(def run-atmospheric
-  (-> atmospheric-stream
-    (.mapValues (reify ValueMapper
-      (apply [_ v]
-        (println "test:" v)
-        v)))
-    (.to (Serdes/ByteArray) json-serde "output-test")))
+(defn get-lat-lon
+  [json]
+  (let [coords {"lat" (-> json (.get "coords") (.get "lat") (.doubleValue))
+                "lon" (-> json (.get "coords") (.get "lon") (.doubleValue))}]
+    (reduce-kv (fn [m k v] (assoc m k (/ (Math/floor (* 10 v)) 10)))
+      {}
+      coords)))
 
-(def stream
-  (KafkaStreams. builder config))
+(defn run-atmospheric
+  [stream]
+  (println stream)
+  (-> stream
+    (.map (reify KeyValueMapper
+      (apply [_ k v]
+        (let [lat-lon       (get-lat-lon v)
+              geodata       (clj-kstreams.geocoder/from-cache (get lat-lon "lat") (get lat-lon "lon"))
+              country-name  (get geodata "countryName")]
+          ;(.put v "geo" (.valueToTree mapper geodata))
+          (.putAll v (.valueToTree mapper geodata))
+          (KeyValue. (when country-name (.getBytes country-name)) v)))))
+    (.filterNot (pred [k _] (nil? k)))
+    (.to (Serdes/ByteArray) json-serde "output-test")))
 
 (defn -main
   "I don't do a whole lot ... yet."
   [& args]
-  run-atmospheric
-  (.start stream)
+  (run-input input-stream)
+  (run-atmospheric atmospheric-stream)
+  (.start (KafkaStreams. builder config))
   (println "Hello, World!"))
